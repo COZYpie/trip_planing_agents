@@ -8,7 +8,9 @@ import logging
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.prebuilt import create_react_agent
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
+from langchain_openai import AzureChatOpenAI
+from functools import lru_cache
+import time
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -18,13 +20,13 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 
 # 初始化语言模型
-model = ChatOpenAI(
-    model="deepseek-chat",
-    openai_api_key="sk-8d71a948abc44172ae9471247099b92b",
-    openai_api_base="https://api.deepseek.com/v1",
-    max_tokens=1024,
+model = AzureChatOpenAI(
+    openai_api_version="2024-12-01-preview",
+    deployment_name="gpt-4o",
+    azure_endpoint="https://ai-14911520644664ai275106389756.openai.azure.com/",
+    api_key="5YzhcN3wCRnFORXYl9SPWpzb7RIPRQmew0V71y0chvR6g6j8hcFOJQQJ99BDACHYHv6XJ3w3AAAAACOGFi3L",
+    max_tokens=2048,
 )
-
 
 # 定义请求数据模型
 class PlanRequest(BaseModel):
@@ -34,30 +36,62 @@ class PlanRequest(BaseModel):
     user_input: str
     selected_draft: Optional[str] = None
 
-
 async def init_mcp_client():
     """异步初始化 MCP 客户端并返回工具"""
     try:
         async with MultiServerMCPClient(
-                {
-                    "gaode": {
-                        "url": "http://localhost:8000/sse",
-                        "transport": "sse",
-                    }
+            {
+                "gaode": {
+                    "url": "http://localhost:8000/sse",
+                    "transport": "sse",
                 }
+            }
         ) as client:
             return client.get_tools()
     except Exception as e:
-        logger.error(f"MCP 客户端初始化失败: {e}")
-        raise HTTPException(status_code=500, detail=f"MCP 客户端初始化失败: {str(e)}")
+        logger.warning(f"MCP 客户端初始化失败: {e}, 使用模拟工具")
+        return [{"name": "mock_weather", "description": "模拟天气查询"}]
 
+async def generate_drafts(agent, city_name: str, days: int, user_input: str, num_drafts: int = 3):
+    """为单个城市生成多个草稿行程，分别偏向运动、文化和美食"""
+    drafts = []
+    draft_prompts = [
+        f"你需要为用户希望的旅行提供更加偏运动的方案选择，快速给出笼统的旅行方案，基于用户偏好：{user_input}，城市：{city_name}，天数：{days}。",
+        f"你需要为用户希望的旅行提供更加偏文化的方案选择，快速给出笼统的旅行方案，基于用户偏好：{user_input}，城市：{city_name}，天数：{days}。",
+        f"你需要为用户希望的旅行提供更加偏美食的方案选择，快速给出笼统的旅行方案，基于用户偏好：{user_input}，城市：{city_name}，天数：{days}。",
+    ]
 
-async def single_city_plan(agent, city_name: str, days: int, preferences: str):
-    """为单个城市生成行程规划，基于用户偏好，使用并行查询优化性能"""
+    async def run_draft_agent(prompt, draft_num):
+        messages = [
+            SystemMessage(
+                f"""为{city_name}的{days}天行程生成一个草稿方案，基于用户偏好：{user_input}。
+                {prompt}
+                输出简洁的文本，概述主要景点、餐饮、住宿和交通安排。"""
+            ),
+            HumanMessage(f"草稿 {draft_num}：{city_name}，{days}天，偏好：{user_input}"),
+        ]
+        try:
+            response = await agent.ainvoke({"messages": messages})
+            return response["messages"][-1].content
+        except Exception as e:
+            logger.error(f"生成草稿 {draft_num} 失败: {e}")
+            return f"草稿 {draft_num} 生成失败: {str(e)}"
+
+    # 并行生成草稿
+    draft_tasks = [run_draft_agent(prompt, i + 1) for i, prompt in enumerate(draft_prompts)]
+    drafts = await asyncio.gather(*draft_tasks, return_exceptions=True)
+    return drafts
+
+async def single_city_plan(agent, city_name: str, days: int, preferences: str, selected_draft: Optional[str] = None, drafts: Optional[list] = None):
+    """为单个城市生成行程规划（修改1：移除综合草稿逻辑）"""
+    start_time = time.time()
+    logger.info(f"开始规划 {city_name} {days}天行程")
+
     # 任务拆分
     messages = [
         SystemMessage(
             f"""将用户对{city_name}的旅游偏好（{preferences}）拆分为景点、住宿、餐饮、出行四个方面的详细要求，适合{days}天行程。
+            参考选定的草稿：{selected_draft or '无'}。
             仅输出有效的 JSON 字符串，格式如下：
             {{"view": "...", "accommodation": "...", "food": "...", "traffic": "..."}}"""
         ),
@@ -77,7 +111,9 @@ async def single_city_plan(agent, city_name: str, days: int, preferences: str):
     traffic = tasks.get("traffic", "")
 
     # 定义并行查询函数
-    async def query_weather():
+    @lru_cache(maxsize=100)
+    async def cache_weather_query(timestamp: int):
+        """缓存天气查询结果，24小时有效"""
         messages = [
             SystemMessage(
                 f"""使用工具查询{city_name}的最新天气信息（包括实况天气和未来{days}天的预报）。
@@ -88,6 +124,12 @@ async def single_city_plan(agent, city_name: str, days: int, preferences: str):
         try:
             response = await agent.ainvoke({"messages": messages})
             return response["messages"][-1].content
+        except Exception as e:
+            return f"天气查询失败: {str(e)}"
+
+    async def query_weather():
+        try:
+            return await cache_weather_query(int(time.time() // 86400))
         except Exception as e:
             return f"天气查询失败: {str(e)}"
 
@@ -105,13 +147,13 @@ async def single_city_plan(agent, city_name: str, days: int, preferences: str):
         except Exception as e:
             return f"景点规划失败: {str(e)}"
 
-    async def query_food(view_plan):
+    async def query_food():
         messages = [
             SystemMessage(
-                f"""结合{city_name}的景点规划和用户偏好（{food}），推荐交通便利、口碑好的餐饮地点，适合{days}天的行程。
+                f"""根据用户偏好（{food}），推荐{city_name}交通便利、口碑好的餐饮地点，适合{days}天的行程。
                 输出清晰的文本，列出餐厅名称、特色菜、地址、价格范围（如果适用）。"""
             ),
-            HumanMessage(f"{city_name}餐饮推荐，偏好：{food}，结合景点：{view_plan}"),
+            HumanMessage(f"{city_name}餐饮推荐，偏好：{food}"),
         ]
         try:
             response = await agent.ainvoke({"messages": messages})
@@ -119,13 +161,13 @@ async def single_city_plan(agent, city_name: str, days: int, preferences: str):
         except Exception as e:
             return f"餐饮规划失败: {str(e)}"
 
-    async def query_accommodation(view_plan):
+    async def query_accommodation():
         messages = [
             SystemMessage(
-                f"""结合{city_name}的景点规划和用户偏好（{accommodation}），推荐靠近景点、交通方便的住宿地点，适合{days}天的行程。
+                f"""根据用户偏好（{accommodation}），推荐{city_name}交通方便的住宿地点，适合{days}天的行程。
                 输出清晰的文本，列出酒店名称、地址、房型、价格范围（如果适用）。"""
             ),
-            HumanMessage(f"{city_name}住宿推荐，偏好：{accommodation}，结合景点：{view_plan}"),
+            HumanMessage(f"{city_name}住宿推荐，偏好：{accommodation}"),
         ]
         try:
             response = await agent.ainvoke({"messages": messages})
@@ -133,13 +175,13 @@ async def single_city_plan(agent, city_name: str, days: int, preferences: str):
         except Exception as e:
             return f"住宿规划失败: {str(e)}"
 
-    async def query_traffic(view_plan, accommodation_plan):
+    async def query_traffic(food_plan, accommodation_plan):
         messages = [
             SystemMessage(
-                f"""结合{city_name}的景点规划、住宿和未来{days}天的天气情况，参考用户偏好（{traffic}），提供详细的出行路线规划，适合{days}天的行程。
+                f"""结合{city_name}的餐饮规划、住宿和未来{days}天的天气情况，参考用户偏好（{traffic}），提供详细的出行路线规划，适合{days}天的行程。
                 输出清晰的文本，包含每段路线的起点、终点、交通方式、预计时间和费用（如果适用）。"""
             ),
-            HumanMessage(f"{city_name}交通规划，偏好：{traffic}，结合景点：{view_plan}，住宿：{accommodation_plan}"),
+            HumanMessage(f"{city_name}交通规划，偏好：{traffic}，餐饮：{food_plan}，住宿：{accommodation_plan}"),
         ]
         try:
             response = await agent.ainvoke({"messages": messages})
@@ -147,22 +189,20 @@ async def single_city_plan(agent, city_name: str, days: int, preferences: str):
         except Exception as e:
             return f"交通规划失败: {str(e)}"
 
-    # 并行执行天气和景点查询
-    weather_task, view_task = await asyncio.gather(query_weather(), query_view(), return_exceptions=True)
+    # 并行执行天气、景点、餐饮、住宿查询
+    weather_task, view_task, food_task, accommodation_task = await asyncio.gather(
+        query_weather(), query_view(), query_food(), query_accommodation(), return_exceptions=True
+    )
     weather_info = weather_task if isinstance(weather_task, str) else str(weather_task)
     view_plan = view_task if isinstance(view_task, str) else str(view_task)
-
-    # 并行执行餐饮和住宿查询（依赖 view_plan）
-    food_task, accommodation_task = await asyncio.gather(
-        query_food(view_plan),
-        query_accommodation(view_plan),
-        return_exceptions=True
-    )
     food_plan = food_task if isinstance(food_task, str) else str(food_task)
     accommodation_plan = accommodation_task if isinstance(accommodation_task, str) else str(accommodation_task)
 
-    # 执行交通查询（依赖 view_plan 和 accommodation_plan）
-    traffic_plan = await query_traffic(view_plan, accommodation_plan)
+    logger.info(f"天气、景点、餐饮、住宿查询耗时: {time.time() - start_time:.2f}秒")
+
+    # 单独执行交通查询
+    traffic_plan = await query_traffic(food_plan, accommodation_plan)
+    logger.info(f"总查询耗时: {time.time() - start_time:.2f}秒")
 
     # 行程汇总
     summary = f"""天气信息：
@@ -183,28 +223,6 @@ async def single_city_plan(agent, city_name: str, days: int, preferences: str):
         "accommodation": accommodation_plan,
         "traffic": traffic_plan
     }
-
-
-async def generate_drafts(agent, city_name: str, days: int, user_input: str, num_drafts: int = 3):
-    """为单个城市生成多个草稿行程"""
-    drafts = []
-    for i in range(num_drafts):
-        messages = [
-            SystemMessage(
-                f"""为{city_name}的{days}天行程生成一个草稿方案，基于用户偏好：{user_input}。
-                输出简洁的文本，概述主要景点、餐饮、住宿和交通安排。
-                确保每个草稿方案唯一。"""
-            ),
-            HumanMessage(f"草稿 {i + 1}：{city_name}，{days}天，偏好：{user_input}"),
-        ]
-        try:
-            response = await agent.ainvoke({"messages": messages})
-            drafts.append(response["messages"][-1].content)
-        except Exception as e:
-            logger.error(f"生成草稿 {i + 1} 失败: {e}")
-            drafts.append(f"草稿 {i + 1} 生成失败: {str(e)}")
-    return drafts
-
 
 async def parse_multi_city_input(agent, user_input: str):
     """解析多城市输入，生成城市列表，包含城市名称、天数和偏好"""
@@ -238,7 +256,6 @@ async def parse_multi_city_input(agent, user_input: str):
     except (json.JSONDecodeError, ValueError) as e:
         logger.error(f"解析多城市输入失败: {e}")
         return []
-
 
 async def plan_multi_city(agent, cities):
     """为多个城市生成综合行程规划，包括城市间交通"""
@@ -277,13 +294,13 @@ async def plan_multi_city(agent, cities):
 
     return complete_plan
 
-
 @app.post("/plan")
 async def plan(request: PlanRequest):
     """处理前端发送的行程规划请求"""
     try:
         tools = await init_mcp_client()
         agent = create_react_agent(model, tools)
+        logger.info(f"收到请求：mode={request.mode}, city={request.city}, days={request.days}, user_input={request.user_input[:50]}...")
 
         if request.mode == "单城市":
             if not request.city or not request.days or request.days <= 0:
@@ -291,8 +308,11 @@ async def plan(request: PlanRequest):
 
             if request.selected_draft:
                 # 根据选定的草稿生成详细计划
-                final_plan = await single_city_plan(agent, request.city, request.days,
-                                                    f"{request.user_input}。选定的草稿：{request.selected_draft}")
+                final_plan = await single_city_plan(
+                    agent, request.city, request.days,
+                    f"{request.user_input}。选定的草稿：{request.selected_draft}",
+                    request.selected_draft
+                )
                 if "error" in final_plan:
                     raise HTTPException(status_code=500, detail=final_plan["error"])
                 return {"final_plan": final_plan}
@@ -315,13 +335,12 @@ async def plan(request: PlanRequest):
             raise HTTPException(status_code=400, detail="无效的模式，仅支持 '单城市' 或 '多城市'")
 
     except HTTPException as e:
+        logger.error(f"HTTP错误: {e.detail}", exc_info=True)
         raise e
     except Exception as e:
-        logger.error(f"行程规划失败: {e}")
+        logger.error(f"行程规划失败: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"行程规划失败: {str(e)}")
-
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=8001)
