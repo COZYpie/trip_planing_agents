@@ -4,6 +4,8 @@ import json
 import logging
 import datetime
 import os
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -63,7 +65,7 @@ st.markdown("""
     }
     .sidebar h2, .sidebar h3, .sidebar h4, .sidebar h5, .sidebar h6, .sidebar p, .sidebar label, .sidebar st-radio, .sidebar st-text-input, .sidebar st-date-input, .sidebar st-text-area, .sidebar st-form > div > button {
         color: #54450d; /* 侧边栏深棕色文本 */
-    }
+ precursor}
     h1 {
         color: #d4a017; /* 金色标题 */
         font-family: 'Arial Black', sans-serif; /* 粗体艺术字体 */
@@ -85,13 +87,21 @@ def icon(emoji: str):
         unsafe_allow_html=True,
     )
 
+def create_session():
+    """创建带重试机制的 HTTP 会话"""
+    session = requests.Session()
+    retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+    session.mount("http://", HTTPAdapter(max_retries=retries))
+    return session
+
 def select_draft(draft):
     """处理草稿选择并生成详细规划"""
     with st.status("🐶 **小金毛生成详细规划中...**", state="running", expanded=True) as status:
         with st.container(height=500, border=False):
             try:
+                session = create_session()
                 logger.info(f"发送草稿选择请求：draft={draft[:50]}...")
-                response = requests.post(
+                response = session.post(
                     "http://localhost:8001/plan",
                     json={
                         "mode": "单城市",
@@ -100,7 +110,7 @@ def select_draft(draft):
                         "user_input": st.session_state.user_input,
                         "selected_draft": draft
                     },
-                    timeout=120
+                    timeout=300
                 )
                 logger.info(f"收到响应：{response.status_code}, {response.text}")
                 st.session_state.last_response = response.text
@@ -114,19 +124,19 @@ def select_draft(draft):
                     st.session_state.stage = "final"
             except requests.Timeout:
                 st.error("请求超时：后端响应时间过长，请检查后端服务")
-                logger.error("请求超时")
+                logger.error("请求超时", exc_info=True)
             except requests.ConnectionError:
                 st.error("无法连接到后端服务：请确保后端服务在 http://localhost:8001 运行，并检查高德 MCP 服务 http://localhost:8000/sse")
-                logger.error("无法连接到后端服务")
+                logger.error("无法连接到后端服务", exc_info=True)
             except requests.InvalidURL:
                 st.error("无效的请求URL：请检查后端服务地址 http://localhost:8001")
-                logger.error("无效的请求URL")
+                logger.error("无效的请求URL", exc_info=True)
             except requests.RequestException as e:
                 st.error(f"请求失败：{str(e)}")
-                logger.error(f"请求失败：{str(e)}")
+                logger.error(f"请求失败：{str(e)}", exc_info=True)
             except ValueError as e:
                 st.error(f"响应解析失败：{str(e)}，后端响应：{st.session_state.last_response}")
-                logger.error(f"响应解析失败：{str(e)}")
+                logger.error(f"响应解析失败：{str(e)}", exc_info=True)
         status.update(label="✅ 小金毛详细规划完成！", state="complete", expanded=False)
 
 if __name__ == "__main__":
@@ -163,15 +173,22 @@ if __name__ == "__main__":
                     if days < 1 or days > 30:
                         st.error("旅行天数必须在 1-30 天之间")
                         days = None
+                    else:
+                        st.info(f"您选择了 {days} 天的行程")
                 else:
                     days = None
                     st.error("请选择有效的日期范围")
-                user_input_placeholder = "请输入您的旅行偏好，例如：喜欢历史文化和美食"
+                user_input_placeholder = "请输入您的旅行偏好，例如：喜欢历史文化、当地美食、舒适的酒店、便捷的公共交通。示例：我想游览北京的历史景点，品尝正宗北京烤鸭，住三星级酒店，优先地铁出行。"
             else:
                 city = None
                 days = None
-                user_input_placeholder = "请输入您的旅行需求，例如：我想去北京、上海玩5天，喜欢历史和美食"
-            user_input = st.text_area("兴趣爱好或行程额外详情", placeholder=user_input_placeholder, height=150)
+                user_input_placeholder = "请输入您的旅行需求，例如：我想去北京3天、上海2天，喜欢历史文化和当地美食，住舒适酒店，优先高铁出行。"
+            user_input = st.text_area(
+                "兴趣爱好或行程额外详情",
+                placeholder=user_input_placeholder,
+                height=200,
+                help="请尽量详细描述您的偏好（如景点类型、餐饮口味、住宿要求、交通方式），以获得更精准的规划！"
+            )
             submitted = st.form_submit_button("提交")
 
         st.markdown("<hr style='border: 2px dotted #d4a017;'>", unsafe_allow_html=True)
@@ -190,12 +207,15 @@ if __name__ == "__main__":
         st.session_state.days = days
         with st.status("🐶 **小金毛正在为您规划...**", state="running", expanded=True) as status:
             with st.container(height=500, border=False):
+                st.markdown("正在生成行程规划，请稍候...")
+                st.spinner("小金毛努力思考中 🐾")
                 try:
-                    logger.info(f"发送请求：mode={mode}, city={city}, days={days}, user_input={user_input}")
-                    response = requests.post(
+                    session = create_session()
+                    logger.info(f"发送请求：mode={mode}, city={city}, days={days}, user_input={user_input[:50]}...")
+                    response = session.post(
                         "http://localhost:8001/plan",
                         json={"mode": mode, "city": city, "days": days, "user_input": user_input},
-                        timeout=120
+                        timeout=180
                     )
                     logger.info(f"收到响应：{response.status_code}, {response.text}")
                     st.session_state.last_response = response.text
@@ -217,22 +237,23 @@ if __name__ == "__main__":
                         st.session_state.stage = "final"
                 except requests.Timeout:
                     st.error("请求超时：后端响应时间过长，请检查后端服务（Azure OpenAI 或高德 MCP）")
-                    logger.error("请求超时")
+                    logger.error("请求超时", exc_info=True)
                     st.session_state.stage = "input"
                 except requests.ConnectionError:
                     st.error("无法连接到后端服务：请确保后端服务在 http://localhost:8001 运行，并检查高德 MCP 服务 http://localhost:8000/sse")
-                    logger.error("无法连接到后端服务")
+                    logger.error("无法连接到后端服务", exc_info=True)
                     st.session_state.stage = "input"
                 except requests.InvalidURL:
                     st.error("无效的请求URL：请检查后端服务地址 http://localhost:8001")
-                    logger.error("无效的请求URL")
+                    logger.error("无效的请求URL", exc_info=True)
+                    st.session_state.stage = "input"
                 except requests.RequestException as e:
                     st.error(f"请求失败：{str(e)}")
-                    logger.error(f"请求失败：{str(e)}")
+                    logger.error(f"请求失败：{str(e)}", exc_info=True)
                     st.session_state.stage = "input"
                 except ValueError as e:
                     st.error(f"响应解析失败：{str(e)}，后端响应：{st.session_state.last_response}")
-                    logger.error(f"响应解析失败：{str(e)}")
+                    logger.error(f"响应解析失败：{str(e)}", exc_info=True)
                     st.session_state.stage = "input"
             status.update(label="✅ 小金毛规划完成！", state="complete", expanded=False)
 
@@ -241,12 +262,12 @@ if __name__ == "__main__":
         st.subheader("您的需求", anchor=False, divider="rainbow")
         st.markdown(f"**用户输入**：{st.session_state.user_input}")
 
-    # 显示草稿方案（横向排列，使用 st.columns）
+    # 显示草稿方案（修改1：移除综合方案，调整为 3 列）
     if st.session_state.stage == "drafts" and st.session_state.drafts:
         st.subheader("小金毛的草稿方案", anchor=False, divider="rainbow")
-        cols = st.columns(3)  # 创建三列布局
+        cols = st.columns(3)  # 调整为 3 列
         for i, draft in enumerate(st.session_state.drafts, 1):
-            with cols[i-1]:  # 每个方案放入对应的列
+            with cols[i-1]:
                 st.markdown(
                     f'<div class="card">'
                     f'<div class="card-title">方案 {i}</div>'
