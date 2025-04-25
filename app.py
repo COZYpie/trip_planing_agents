@@ -1,4 +1,5 @@
 import streamlit as st
+from streamlit_lottie import st_lottie
 import requests
 import json
 import logging
@@ -6,6 +7,8 @@ import datetime
 import os
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import random
+import time
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -262,6 +265,7 @@ if __name__ == "__main__":
         st.subheader("您的需求", anchor=False, divider="rainbow")
         st.markdown(f"**用户输入**：{st.session_state.user_input}")
 
+
     # 显示草稿方案（修改1：移除综合方案，调整为 3 列）
     if st.session_state.stage == "drafts" and st.session_state.drafts:
         st.subheader("小金毛的草稿方案", anchor=False, divider="rainbow")
@@ -298,18 +302,32 @@ if __name__ == "__main__":
         st.info("请在侧栏输入具体城市和天数，继续规划单城市行程。")
 
     # 显示详细规划
+    # 在 if st.session_state.stage == "final" and st.session_state.final_plan: 块中，替换天气信息相关代码
     if st.session_state.stage == "final" and st.session_state.final_plan:
         st.subheader("小金毛的详细行程规划", anchor=False, divider="rainbow")
         with st.container():
-            st.markdown(f"**规划总结**：{st.session_state.final_plan['summary']}")
-            with st.expander("详细安排"):
-                st.markdown("#### 景点安排")
-                st.write(st.session_state.final_plan['view'])
-                st.markdown("#### 餐饮安排")
-                st.write(st.session_state.final_plan['food'])
-                st.markdown("#### 住宿安排")
-                st.write(st.session_state.final_plan['accommodation'])
-                st.markdown("#### 出行安排")
-                st.write(st.session_state.final_plan['traffic'])
+            # 显示 summary_source
+            source_text = "总结 Agent" if st.session_state.final_plan['summary_source'] == "agent" else "字符串拼接（回退）"
+            st.markdown(f"**规划生成方式**：{source_text}")
+            st.markdown(f"**详细行程规划**：\n{st.session_state.final_plan['summary']}")
+            with st.expander("单独查看各项安排"):
+                st.markdown(f"**景区安排**：\n{st.session_state.final_plan['view']}")
+                st.markdown(f"**餐饮安排**：\n{st.session_state.final_plan['food']}")
+                st.markdown(f"**住宿安排**：\n{st.session_state.final_plan['accommodation']}")
+                st.markdown(f"**出行安排**：\n{st.session_state.final_plan['traffic']}")
+                # 显示天气信息
+                weather_info = st.session_state.final_plan.get('weather', None)
+                if weather_info and "天气查询失败" not in weather_info:
+                    st.markdown(f"**天气信息**：\n{weather_info}")
+                else:
+                    # 备选：从 summary 中提取
+                    if '天气信息：' in st.session_state.final_plan['summary']:
+                        summary_weather = st.session_state.final_plan['summary'].split('天气信息：')[-1].strip()
+                        if summary_weather and "天气查询失败" not in summary_weather:
+                            st.markdown(f"**天气信息（从总结提取）**：\n{summary_weather}")
+                        else:
+                            st.markdown(f"**天气信息**：\n{weather_info or summary_weather or '无法获取天气信息，请检查日志或网络连接'}")
+                    else:
+                        st.markdown(f"**天气信息**：\n{weather_info or '无法获取天气信息，请检查日志或网络连接'}")
         if st.button("返回草稿"):
             st.session_state.stage = "drafts"
